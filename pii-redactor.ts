@@ -1,6 +1,7 @@
 /**
  * PII Redaction Utility
- *
+ * Author: Ronaldo Nascimento    ronaldon2023@gmail.com    Nov-20-2025    
+ * Version:1.0
  * Detects and redacts Personally Identifiable Information (PII) from text.
  * Compliant with GDPR, CCPA, and SOC 2 requirements.
  *
