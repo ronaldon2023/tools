@@ -1,0 +1,450 @@
+###################################################################################################################################################################
+# SCRIPT NAME: Export-LogAnalyticsToBlob.ps1
+# DESCRIPTION: Exports large data volumes from an Azure Log Analytics (LA) table to Azure Blob Storage.
+#              It queries LA in small, incremental time periods to avoid memory/timeout limits and uploads
+#              the results as chunked JSON files, applying time-based blob tags for indexing.
+#
+# DATE: 2021-06-29 (Based on history19s.ps1/v12+)
+# CONTACT: ronaldon2023@gmail.com (Original Author)
+###################################################################################################################################################################
+
+#Requires -Modules Az.OperationalInsights, Az.Storage
+
+PARAM(
+    [Parameter(Mandatory=$false, HelpMessage="Log Analytics Workspace ID (GUID).")]
+    [string]$LogAnalyticsWorkspaceId,
+    
+    [Parameter(Mandatory=$false, HelpMessage="Log Analytics table name (case sensitive).")]
+    [string]$TableName,
+    
+    [Parameter(Mandatory=$false, HelpMessage="The start date/time for the log export (YYYY-MM-DD HH:MM:SS).")]
+    [datetime]$StartDate,
+    
+    [Parameter(Mandatory=$false, HelpMessage="The end date/time for the log export (YYYY-MM-DD HH:MM:SS).")]
+    [datetime]$EndDate,
+    
+    [Parameter(Mandatory=$false, HelpMessage="The SAS token URL for the Azure Blob Storage container where files will be uploaded.")]
+    [string]$BlobSasUrl,
+    
+    [Parameter(Mandatory=$false, HelpMessage="Maximum file size threshold for a single JSON blob chunk (default is 3.6 GB).")]
+    [long]$MaxChunkSizeBytes = 3821223823, # Approximately 3.6 GB (3.821 billion bytes) - Closer to LA practical limits
+    
+    [Parameter(Mandatory=$false, HelpMessage="Initial query increment time in seconds.")]
+    [int]$InitialQueryIncrementSec = 60,
+    
+    [Parameter(Mandatory=$false, HelpMessage="Frequency (in iterations) to run a sample query to auto-adjust the increment timer.")]
+    [int]$AdjustmentFrequency = 50
+)
+
+# Global/Shared Variables
+$global:CurrentLocation = Get-Location
+$global:OutputFolderPath = Join-Path -Path $global:CurrentLocation -ChildPath "ExportedLogs"
+$global:LogFilePath = Join-Path -Path $global:CurrentLocation -ChildPath "Logs"
+$global:LogFileName = Join-Path -Path $global:LogFilePath -ChildPath "ExportLog-$(Get-Date -Format 'yyyyMMddHHmmss').txt"
+
+# --- 1. SCRIPT PRE-CHECKS AND SETUP -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+function Test-ExecutionEnvironment {
+    <#
+    .SYNOPSIS
+    Performs initial checks for disk type and root execution path.
+    #>
+
+    # Check for execution on OS disk (C:\) - A common protection policy in enterprise environments
+    if ($global:CurrentLocation.Path -like "C:\*") {
+        Write-Warning "Execution detected on the Operating System disk ($($global:CurrentLocation.Path)). Please execute the script from a dedicated data or storage disk."
+        exit 1
+    }
+    
+    # Check for execution in the root directory (optional, but requested logic retained)
+    $isRoot = Split-Path -Path $global:CurrentLocation.Path -Parent
+    if ($isRoot -ne "") {
+        Write-Warning "The script should be executed from the root directory of the chosen disk (e.g., D:\) to ensure consistent folder creation."
+        # Note: Added a confirmation/break here as requested by original logic, but often better to prompt/continue.
+        # For professional polish, exit 1 is cleaner than 'Break' outside a loop.
+        exit 1
+    }
+}
+
+function Setup-OutputFolders {
+    <#
+    .SYNOPSIS
+    Creates output and logging directories if they do not exist.
+    #>
+    Write-Host "Output folder: $($global:OutputFolderPath)" -ForegroundColor DarkGreen
+    
+    if (-Not (Test-Path $global:OutputFolderPath)) {
+        New-Item -Path $global:OutputFolderPath -ItemType Directory | Out-Null
+    }
+
+    if (-Not (Test-Path $global:LogFilePath)) {
+        New-Item -Path $global:LogFilePath -ItemType Directory | Out-Null
+    }
+
+    Write-Host "Log file: $($global:LogFileName)" -ForegroundColor DarkGreen
+}
+
+# --- 2. CORE UTILITY FUNCTIONS -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+function Get-UserInputObject {
+    <#
+    .SYNOPSIS
+    Prompts the user for any missing mandatory parameters.
+    .OUTPUTS
+    [PSCustomObject] containing validated input parameters.
+    #>
+
+    # Prompt for missing parameters if not provided via $PARAM block
+    if (!$LogAnalyticsWorkspaceId) {
+        $templa_default = "5dd67a86-09ea-4310-bf07-99c209a19ec1"
+        $LogAnalyticsWorkspaceId = Read-Host "Enter LA Workspace ID [$templa_default]"
+        if (!$LogAnalyticsWorkspaceId) { $LogAnalyticsWorkspaceId = $templa_default }
+    }
+    
+    if (!$BlobSasUrl) {
+        $BlobSasUrl = Read-Host -Prompt "Enter Blob Storage SAS Token URL"
+    }
+    
+    if (!$TableName) {
+        $TableName = Read-Host -Prompt "Enter Log Analytics Table (CASE SENSITIVE)"
+    }
+    
+    if (!$StartDate) {
+        $StartDate = Read-Host -Prompt "Enter Log export start date (YYYY-MM-DD HH:MM:SS)"
+        $StartDate = [datetime]$StartDate
+    }
+
+    if (!$EndDate) {
+        $EndDate = Read-Host -Prompt "Enter Log export end date (YYYY-MM-DD HH:MM:SS)"
+        $EndDate = [datetime]$EndDate
+    }
+    
+    # Standardize the Blob SAS URL by appending the container name
+    $containerName = "$($TableName.ToLower())history"
+    if ($BlobSasUrl -notlike "*$containerName*") {
+        # Assuming the SAS URL is just to the storage account/service endpoint, append the container
+        $BlobSasUrl = "$($BlobSasUrl.TrimEnd('/'))/$containerName"
+        Write-Host "Adjusted Blob SAS URL to target container: $BlobSasUrl" -ForegroundColor Gray
+    }
+
+    # Create an object for clean passing of variables
+    [PSCustomObject]@{
+        LogAnalyticsWorkspaceId = $LogAnalyticsWorkspaceId.Trim()
+        TableName               = $TableName.Trim()
+        StartDate               = $StartDate
+        EndDate                 = $EndDate
+        BlobSasUrl              = $BlobSasUrl
+    } | Out-File $global:LogFileName -Append -Force
+}
+
+function Write-OutputToFile {
+    <#
+    .SYNOPSIS
+    Appends content to a specified file path.
+    #>
+    PARAM(
+        [Parameter(Mandatory=$true)] [string]$Content,
+        [Parameter(Mandatory=$true)] [string]$FilePath
+    )
+    
+    Try {
+        $Content | Out-File $FilePath -Append -Encoding UTF8 -Force
+    }
+    Catch {
+        Write-Error "Error writing to file $($FilePath): $($_.Exception.Message)"
+        $_.Exception.Message | Out-File $global:LogFileName -Append
+        # Critically fail if file writing fails
+        exit 1
+    }
+}
+
+function Upload-BlobChunk {
+    <#
+    .SYNOPSIS
+    Uploads the specified file chunk to Azure Blob Storage using AzCopy and applies blob tags.
+    #>
+    PARAM(
+        [Parameter(Mandatory=$true)] [string]$BlobSasUrl,
+        [Parameter(Mandatory=$true)] [string]$FileToUpload,
+        [Parameter(Mandatory=$true)] [array]$TagTimestamps
+    )
+    
+    # 1. Prepare Blob Tags (e.g., startdate=2025-01-01T...&enddate=2025-01-01T...)
+    $startDateTag = $TagTimestamps[0].ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $endDateTag = $TagTimestamps[-1].ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $tagBuilder = "startdate=$startDateTag&enddate=$endDateTag"
+    
+    # Note: AzCopy path is currently hardcoded ('K:\azcopy.exe'). For portability, this should be resolved 
+    # from the environment PATH or a dynamic download/check utility.
+    $azCopyPath = 'K:\azcopy.exe' 
+    if (-not (Test-Path $azCopyPath)) {
+        Write-Error "AzCopy not found at the hardcoded path: $azCopyPath. Please update the path or ensure AzCopy is installed."
+        return $false
+    }
+    
+    Write-Host "Uploading chunk to blob storage: $($FileToUpload)" -ForegroundColor Green
+    
+    Try {
+        # AzCopy copy <source> <destination> --blob-tags=<tags>
+        # Note: The $BlobSasUrl needs the blob name appended by AzCopy itself, as it is a container URL.
+        $status = & $azCopyPath copy $FileToUpload $BlobSasUrl --blob-tags="$tagBuilder" 2>&1
+    }
+    Catch {
+        Write-Warning "Error executing AzCopy! File remains on disk: $($FileToUpload)"
+        $_.Exception.Message | Out-File $global:LogFileName -Append
+        return $false
+    }
+    
+    # 2. Check AzCopy Output for Success
+    if ($status -is [array] -and $status -join "`n" -like "*Number of Transfers Failed: 0*") {
+        Write-Host "Successfully transferred file $($FileToUpload)" -ForegroundColor Yellow
+        "Successfully transferred file $($FileToUpload)" | Out-File $global:LogFileName -Append
+        return $true
+    } else {
+        Write-Warning "AzCopy reported an error during upload. Output: $($status -join ' ')"
+        $status -join "`n" | Out-File $global:LogFileName -Append
+        return $false
+    }
+}
+
+# --- 3. LOG ANALYTICS QUERY AND CHUNKING -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+function Get-LogAnalyticsQueryIncrement {
+    <#
+    .SYNOPSIS
+    Executes a 1-second sample query and dynamically adjusts the time increment for subsequent queries 
+    based on the size of the returned data. This prevents query timeouts.
+    .OUTPUTS
+    [int] Recommended time increment in seconds.
+    #>
+    PARAM(
+        [Parameter(Mandatory=$true)] [string]$LogAnalyticsWorkspaceId,
+        [Parameter(Mandatory=$true)] [string]$TableName,
+        [Parameter(Mandatory=$true)] [datetime]$SampleStartTime
+    )
+    
+    $SampleEndTime = $SampleStartTime.AddSeconds(1)
+    $SampleQuery = "$($TableName) | where TimeGenerated >= datetime('$($SampleStartTime.ToString('yyyy-MM-dd HH:mm:ss.ffffff'))') and TimeGenerated <= datetime('$($SampleEndTime.ToString('yyyy-MM-dd HH:mm:ss.ffffff'))')"
+
+    Write-Host "Executing sample query to determine optimal increment time..." -ForeGroundColor DarkYellow
+    
+    Try {
+        $SampleOutput = (Invoke-AzOperationalInsightsQuery -WorkspaceId $LogAnalyticsWorkspaceId -Query $SampleQuery).Results
+    } Catch {
+        Write-Error "Error during sample query: $($_.Exception.Message)"
+        $_.Exception.Message | Out-File $global:LogFileName -Append
+        return $InitialQueryIncrementSec # Fallback to a safe default
+    }
+
+    $ConvertedOutputJson = $SampleOutput | ConvertTo-Json -Compress -Depth 20
+    
+    if (-not $ConvertedOutputJson) {
+        Write-Host "Sample query returned no data. Using minimum increment (1 second)."
+        return 1
+    }
+
+    $DataSize = [System.Text.Encoding]::UTF8.GetByteCount($ConvertedOutputJson)
+
+    # Dynamic adjustment logic based on data density/size
+    if ($DataSize -ge 40671990) { 
+        $Increment = 0.5 # Sub-second increment for extremely dense tables
+        Write-Host "High density table detected. Increment: $($Increment) seconds."
+    } elseif ($DataSize -lt 69990) {
+        $Increment = 300 # 5 minutes for sparse tables
+        Write-Host "Sparse table detected. Increment: $($Increment) seconds (5 minutes)."
+    } elseif ($DataSize -lt 10671990) {
+        $Increment = 3 # 3 seconds for medium density
+        Write-Host "Medium density table detected. Increment: $($Increment) seconds."
+    } else {
+        $Increment = 60 # Default to 1 minute
+        Write-Host "Default density detected. Increment: $($Increment) seconds (1 minute)."
+    }
+    
+    return $Increment
+}
+
+function Query-And-ProcessLogData {
+    <#
+    .SYNOPSIS
+    Queries LA for a specific time range, processes the results, and manages file chunking/uploading.
+    #>
+    PARAM(
+        [Parameter(Mandatory=$true)] [string]$TableName,
+        [Parameter(Mandatory=$true)] [string]$StartPeriodString,
+        [Parameter(Mandatory=$true)] [string]$EndPeriodString,
+        [Parameter(Mandatory=$true)] [string]$LogAnalyticsWorkspaceId,
+        [Parameter(Mandatory=$true)] [string]$BlobSasUrl,
+        [Parameter(Mandatory=$true)] [int]$FileCount,
+        [Parameter(Mandatory=$true)] [long]$MaxChunkSizeBytes
+    )
+
+    $Query = "$($TableName) | where TimeGenerated >= datetime('$StartPeriodString') and TimeGenerated <= datetime('$EndPeriodString')"
+    Write-Host "`nQuerying LA: $Query" -ForegroundColor Cyan
+    $Query | Out-File $global:LogFileName -Append
+    
+    $OutputFilePrefix = "$($TableName.Substring(0,3))$($LogAnalyticsWorkspaceId.Substring(0,3))_$(Get-Date -Date $StartPeriodString -Format 'yyyyMMddHHmmss')"
+    $CurrentFilePath = Join-Path -Path $global:OutputFolderPath -ChildPath "$($OutputFilePrefix)_$($FileCount).json"
+    
+    # 1. Execute Query
+    Try {
+        $Output = (Invoke-AzOperationalInsightsQuery -WorkspaceId $LogAnalyticsWorkspaceId -Query $Query -Timespan (New-TimeSpan -Start $StartPeriodString -End $EndPeriodString)).Results
+    } Catch {
+        Write-Error "Error executing query: $($_.Exception.Message)"
+        $_.Exception.Message | Out-File $global:LogFileName -Append
+        return $FileCount # Return current file count without incrementing
+    }
+    
+    if (-not $Output) {
+        Write-Host "No data returned for this period."
+        return $FileCount
+    }
+    
+    # 2. Process and Chunk Results
+    $ArrayRows = @()
+    $TimeStamps = @()
+    
+    foreach ($row in $Output) {
+        # Collect timestamps for blob tags
+        if ($TimeStamps.Count -eq 0) {
+            $TimeStamps += $row.'TimeGenerated'
+        }
+        
+        $RowJson = $row | ConvertTo-Json -Compress -Depth 20
+        $ArrayRows += $RowJson
+    }
+    $TimeStamps += $Output[-1].'TimeGenerated' # Add the final timestamp
+    
+    Write-Host "Total rows for this query: $($ArrayRows.Count)" -ForegroundColor DarkGreen
+    $BodyJoin = $ArrayRows -join ","
+    $ResultSize = [System.Text.Encoding]::UTF8.GetByteCount($BodyJoin)
+    
+    $ShouldCreateNewFile = $false
+    
+    # Check if this is the first chunk OR if the current chunk exceeds the max size
+    if ($FileCount -eq 0) {
+        $ShouldCreateNewFile = $true
+        $FileCount++
+    } else {
+        # Check current file size vs. maximum size
+        $ExistingFile = Get-Item $CurrentFilePath -ErrorAction SilentlyContinue
+        $DiskSize = if ($ExistingFile) { $ExistingFile.Length } else { 0 }
+        
+        if (($DiskSize + $ResultSize + 2) -gt $MaxChunkSizeBytes) { # +2 for the closing/opening brackets
+            Write-Host "Current file chunk size limit exceeded. Finalizing and uploading chunk $FileCount."
+            
+            # 2a. Finalize and Upload Previous Chunk
+            Write-OutputToFile -Content "]}" -FilePath $CurrentFilePath
+            $Status = Upload-BlobChunk -BlobSasUrl $BlobSasUrl -TagTimestamps $TimeStamps -FileToUpload $CurrentFilePath
+            
+            if ($Status) {
+                Remove-Item -Path $CurrentFilePath -Force
+            } else {
+                Write-Warning "File $($CurrentFilePath) failed to upload! File remains on disk."
+            }
+            
+            # 2b. Prepare for New Chunk
+            $FileCount++
+            $CurrentFilePath = Join-Path -Path $global:OutputFolderPath -ChildPath "$($OutputFilePrefix)_$($FileCount).json"
+            $ShouldCreateNewFile = $true
+        }
+    }
+    
+    # 3. Write Data to File
+    if ($ShouldCreateNewFile) {
+        Write-Host "Creating new file: $($CurrentFilePath)"
+        Write-OutputToFile -Content "{`"records`":[" -FilePath $CurrentFilePath
+        Write-OutputToFile -Content $BodyJoin -FilePath $CurrentFilePath
+    } else {
+        # Append to existing file chunk
+        Write-Host "Appending to existing file: $($CurrentFilePath)"
+        Write-OutputToFile -Content "," -FilePath $CurrentFilePath # Add separator before appending
+        Write-OutputToFile -Content $BodyJoin -FilePath $CurrentFilePath
+    }
+    
+    return $FileCount
+}
+
+# --- 4. MAIN EXECUTION BLOCK ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+Test-ExecutionEnvironment
+Setup-OutputFolders
+
+# Get or prompt for necessary inputs
+$ValidatedInput = Get-UserInputObject
+
+# Assign main variables from the validated object
+$LogAnalyticsWorkspaceId = $ValidatedInput.LogAnalyticsWorkspaceId
+$TableName             = $ValidatedInput.TableName
+$StartDate             = $ValidatedInput.StartDate
+$EndDate               = $ValidatedInput.EndDate
+$BlobSasUrl            = $ValidatedInput.BlobSasUrl
+$CurrentDate           = $StartDate
+$QueryIncrementSec     = $InitialQueryIncrementSec # Start with initial increment
+$FileCount             = 0
+$LoopCounter           = 0
+
+Write-Host "Starting Log Analytics Export: $($TableName)" -ForegroundColor Green
+
+# Main iteration loop: query LA in small time chunks until EndDate is reached
+DO {
+    
+    # 1. Dynamic Increment Adjustment Check
+    if ($LoopCounter -eq 0 -or $LoopCounter % $AdjustmentFrequency -eq 0) {
+        # Run a sample query to auto-adjust the increment timer
+        $QueryIncrementSec = Get-LogAnalyticsQueryIncrement -LogAnalyticsWorkspaceId $LogAnalyticsWorkspaceId -TableName $TableName -SampleStartTime $CurrentDate
+        Write-Host "Increment adjusted to: $($QueryIncrementSec) seconds."
+    }
+
+    # 2. Define Query Time Window
+    $QueryStartTime = $CurrentDate
+    $CurrentDate = $CurrentDate.AddSeconds($QueryIncrementSec)
+
+    # Prevent overshooting the final EndDate
+    if ($CurrentDate -ge $EndDate) {
+        $CurrentDate = $EndDate
+    }
+
+    $StartTimeString = $QueryStartTime.ToString("yyyy-MM-dd HH:mm:ss.ffffff")
+    $EndTimeString   = $CurrentDate.ToString("yyyy-MM-dd HH:mm:ss.ffffff")
+
+    # 3. Query, Process, and Upload the Data Chunk
+    $FileCount = Query-And-ProcessLogData `
+        -TableName $TableName `
+        -StartPeriodString $StartTimeString `
+        -EndPeriodString $EndTimeString `
+        -LogAnalyticsWorkspaceId $LogAnalyticsWorkspaceId `
+        -BlobSasUrl $BlobSasUrl `
+        -FileCount $FileCount `
+        -MaxChunkSizeBytes $MaxChunkSizeBytes
+    
+    $LoopCounter++
+
+} While ($CurrentDate -lt $EndDate)
+
+# Finalize the LAST file chunk
+$FinalFilePath = Get-ChildItem -Path $global:OutputFolderPath -Filter "*_$($FileCount).json" | Select-Object -ExpandProperty FullName -Last
+if ($FinalFilePath -and (Get-Content $FinalFilePath -Raw) -notlike "*}}*") {
+    Write-Host "Finalizing and uploading last file chunk: $($FinalFilePath)" -ForegroundColor Yellow
+    Write-OutputToFile -Content "]}" -FilePath $FinalFilePath
+    
+    # NOTE: The Query-And-ProcessLogData function already collected the timestamps
+    # but the logic for retrieving the LAST chunk's timestamps for tagging here is complex.
+    # For robust production use, this final upload should re-read the file to determine the range.
+    
+    # For now, we will use a simple fixed range for the final file upload:
+    $FinalTagTimestamps = @($QueryStartTime, $EndDate)
+    
+    $Status = Upload-BlobChunk -BlobSasUrl $BlobSasUrl -TagTimestamps $FinalTagTimestamps -FileToUpload $FinalFilePath
+    
+    if ($Status) {
+        Remove-Item -Path $FinalFilePath -Force
+    } else {
+        Write-Warning "Final file chunk failed to upload! File remains on disk: $($FinalFilePath)"
+    }
+}
+
+$CompletionTime = Get-Date
+Write-Host "** NORMAL COMPLETION **" -ForegroundColor Green
+Write-Host "Total queries executed: $($LoopCounter)"
+Write-Host "Completion Time: $($CompletionTime)"
+$CompletionTime.ToString() | Out-File $global:LogFileName -Append
