@@ -4,6 +4,9 @@ Reddit global post-rate monitor
 - Uses free OAuth (script app)
 - Logs posts/minute to CSV + console
 - Runs forever (Ctrl-C to stop)
+Author:Ronaldo Nascimento  ronaldon2023@gmail.com
+Remarks: This is part of a threat intel tool to monitor the number of Reddit posts based on given keywords so that
+security engineers can assess the reaction to posts regarding a given published threat.
 """
 
 import os
